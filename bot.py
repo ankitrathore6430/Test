@@ -1,21 +1,82 @@
 import logging
 import threading
+import sqlite3
+import pickle
+import os
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext
 from telegram.constants import ParseMode
 
-# --- Flask App Setup ---
-# This part runs a simple web server to keep the bot alive on hosting services like Render.
-app = Flask(__name__)
+# --- Database Setup ---
+DB_FILE = "jobs.db"
 
+def init_db():
+    """Initialize the SQLite database."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS jobs (
+            chat_id INTEGER PRIMARY KEY,
+            job_data BLOB
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized.")
+
+def save_job_to_db(chat_id, job_data):
+    """Save a job's data to the database."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # Serialize the job_data dictionary using pickle
+    serialized_data = pickle.dumps(job_data)
+    # Use INSERT OR REPLACE to handle both new and existing jobs
+    cursor.execute("INSERT OR REPLACE INTO jobs (chat_id, job_data) VALUES (?, ?)", (chat_id, serialized_data))
+    conn.commit()
+    conn.close()
+    logger.info(f"Job for chat_id {chat_id} saved to database.")
+
+def load_job_from_db(chat_id):
+    """Load a single job's data from the database."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT job_data FROM jobs WHERE chat_id = ?", (chat_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        # Deserialize the data using pickle
+        return pickle.loads(row[0])
+    return None
+
+def load_all_jobs_from_db():
+    """Load all jobs from the database."""
+    if not os.path.exists(DB_FILE):
+        return []
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT chat_id, job_data FROM jobs")
+    rows = cursor.fetchall()
+    conn.close()
+    # Deserialize each job's data
+    return [(row[0], pickle.loads(row[1])) for row in rows]
+
+def delete_job_from_db(chat_id):
+    """Delete a job from the database."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM jobs WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"Job for chat_id {chat_id} deleted from database.")
+
+# --- Flask App Setup ---
+app = Flask(__name__)
 @app.route('/')
 def index():
     return "I'm alive!"
 
 def run_flask():
-    # The host must be '0.0.0.0' to be reachable by external services.
-    # The port can be any available port, e.g., 8080.
     app.run(host='0.0.0.0', port=8080)
 
 # --- Telegram Bot Setup ---
@@ -40,6 +101,7 @@ async def send_recurring_message(context: CallbackContext) -> None:
     try:
         if media_type == 'text':
             await context.bot.send_message(job.chat_id, text=job_data['text'])
+        # ... (add other media types as before)
         elif media_type == 'photo':
             await context.bot.send_photo(job.chat_id, photo=job_data['file_id'], caption=job_data.get('caption'))
         elif media_type == 'video':
@@ -55,25 +117,21 @@ async def send_recurring_message(context: CallbackContext) -> None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Hi! I am a recurring message bot.\n\n"
-        "To set a recurring message, reply to any message and use:\n"
-        "/set <minutes>\n\n"
-        "Use /status to see the current schedule.\n"
-        "Use /stop to stop the recurring message.\n"
-        "Use /help to see more details."
+        "Hi! I am a persistent recurring message bot.\n\n"
+        "My schedules are now saved and will survive restarts.\n\n"
+        "Use /set, /stop, and /status as before."
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Here's how to use me:\n\n"
         "▶️ *To set a schedule:*\n"
-        "1. Send any message (text, photo, video, etc.).\n"
-        "2. Reply to that message with the command `/set <minutes>`.\n"
-        "   (Time must be between 1 and 60 minutes).\n\n"
+        "1. Send any message (text, photo, etc.).\n"
+        "2. Reply to it with `/set <minutes>`.\n\n"
         "▶️ *To check the schedule:*\n"
-        "   Use the command `/status`.\n\n"
+        "   Use `/status`.\n\n"
         "▶️ *To stop the schedule:*\n"
-        "   Use the command `/stop`.",
+        "   Use `/stop`.",
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
@@ -82,7 +140,7 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     replied_message = update.message.reply_to_message
 
     if not replied_message:
-        await update.message.reply_text("Error: You need to reply to a message to set it on a recurring schedule.")
+        await update.message.reply_text("Error: You must reply to a message to schedule it.")
         return
 
     try:
@@ -95,6 +153,7 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             'media_type': None, 'interval_minutes': minutes, 'text': None, 
             'caption': None, 'file_id': None
         }
+        # ... (logic to populate job_data based on replied_message)
         if replied_message.text:
             job_data.update({'media_type': 'text', 'text': replied_message.text})
         elif replied_message.photo:
@@ -108,12 +167,15 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         elif replied_message.sticker:
             job_data.update({'media_type': 'sticker', 'file_id': replied_message.sticker.file_id})
         else:
-            await update.message.reply_text("Sorry, I can only schedule text, photos, videos, documents, audio, or stickers.")
+            await update.message.reply_text("Sorry, that media type is not supported.")
             return
 
+        # Save to DB first
+        save_job_to_db(chat_id, job_data)
+
+        # Then schedule in memory
         interval_seconds = minutes * 60
-        job_removed = remove_job_if_exists(str(chat_id), context)
-        
+        remove_job_if_exists(str(chat_id), context)
         context.job_queue.run_repeating(
             send_recurring_message,
             interval=interval_seconds,
@@ -123,30 +185,36 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             data=job_data
         )
 
-        text = f"✅ Message set successfully! It will repeat every {minutes} minute(s)."
-        if job_removed:
-            text += "\n\n_The old schedule was replaced._"
-        await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        await update.effective_message.reply_text(f"✅ Message set successfully! It will repeat every {minutes} minute(s).")
 
     except (IndexError, ValueError):
         await update.effective_message.reply_text("Usage: Reply to a message with `/set <minutes>`")
 
 async def stop_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
-    job_removed = remove_job_if_exists(str(chat_id), context)
-    text = "Timer successfully stopped!" if job_removed else "You do not have an active timer."
-    await update.message.reply_text(text)
+    
+    # Remove from memory and DB
+    remove_job_if_exists(str(chat_id), context)
+    delete_job_from_db(chat_id)
+    
+    await update.message.reply_text("Timer successfully stopped! The schedule has been cleared.")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    
+    # Check the database directly for the most reliable status
+    job_data = load_job_from_db(chat_id)
 
-    if not current_jobs:
+    if not job_data:
         await update.message.reply_text("There is no recurring message scheduled for this chat.")
         return
 
-    job = current_jobs[0]
-    job_data = job.data
+    # Check in-memory jobs to get the next run time
+    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    next_run_display = "Pending restart..."
+    if current_jobs and current_jobs[0].next_t:
+        next_run_display = current_jobs[0].next_t.strftime('%Y-%m-%d %H:%M:%S UTC')
+
     interval = job_data.get('interval_minutes', 'N/A')
     media_type = job_data.get('media_type', 'Unknown').capitalize()
     
@@ -160,14 +228,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if caption:
             content_desc += f" with caption: \"{caption}\""
     
-    next_run_utc = job.next_t.strftime('%Y-%m-%d %H:%M:%S UTC')
-
     status_message = (
-        "ℹ️ **Current Schedule Status**\n\n"
+        f"ℹ️ **Current Schedule Status**\n\n"
         f"**Frequency:** Every {interval} minute(s)\n"
         f"**Content Type:** {media_type}\n"
         f"**Content Preview:** {content_desc}\n"
-        f"**Next Send Time:** {next_run_utc}"
+        f"**Next Send Time:** {next_run_display}"
     )
 
     await update.message.reply_text(status_message, parse_mode=ParseMode.MARKDOWN)
@@ -175,20 +241,36 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     new_members = update.message.new_chat_members
     for member in new_members:
-        welcome_message = f"Welcome to the group, {member.first_name}! We're glad to have you here."
-        await update.message.reply_text(welcome_message)
+        await update.message.reply_text(f"Welcome, {member.first_name}!")
 
 def main() -> None:
-    """Run the bot and the web server."""
-    # Start Flask server in a new thread
+    """Run the bot, the web server, and load jobs from the database."""
+    # Initialize the database
+    init_db()
+
+    # Start Flask server
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-    print("Uptime server started...")
+    logger.info("Uptime server started.")
 
     # --- Telegram Bot Setup ---
     BOT_TOKEN = "1233674761:AAEBZHtON8aNiahNYslG4Hi9IqQFIaQUFUE"
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # Load and reschedule jobs from the database on startup
+    jobs_to_load = load_all_jobs_from_db()
+    for chat_id, job_data in jobs_to_load:
+        interval_seconds = job_data.get('interval_minutes', 1) * 60
+        application.job_queue.run_repeating(
+            send_recurring_message,
+            interval=interval_seconds,
+            first=10,  # Send 10s after restart to avoid spam
+            chat_id=chat_id,
+            name=str(chat_id),
+            data=job_data
+        )
+    logger.info(f"Loaded and rescheduled {len(jobs_to_load)} jobs from the database.")
 
     # Register command handlers
     application.add_handler(CommandHandler("start", start))
@@ -196,12 +278,10 @@ def main() -> None:
     application.add_handler(CommandHandler("set", set_timer))
     application.add_handler(CommandHandler("stop", stop_timer))
     application.add_handler(CommandHandler("status", status_command))
-
-    # Register handler for new members
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
 
     # Start the Bot
-    print("Bot is running... Press Ctrl-C to stop.")
+    logger.info("Bot is running...")
     application.run_polling()
 
 if __name__ == "__main__":
