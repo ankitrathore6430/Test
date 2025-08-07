@@ -12,13 +12,6 @@ from telegram.constants import ParseMode
 DISK_PATH = "/var/data"
 DB_FILE = os.path.join(DISK_PATH, "jobs.db")
 
-# --- Telegram Bot Setup ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-
 def init_db():
     """Initialize the SQLite database in the persistent disk path."""
     try:
@@ -35,8 +28,7 @@ def init_db():
         logger.info(f"Database initialized successfully at {DB_FILE}")
     except sqlite3.OperationalError as e:
         logger.critical(f"FAILED TO INITIALIZE DATABASE at {DB_FILE}: {e}")
-        logger.critical("This is likely a file permissions issue on your hosting service. Ensure the bot has write access to the persistent disk directory.")
-
+        logger.critical("This is likely a file permissions issue on your hosting service.")
 
 def save_job_to_db(chat_id, job_data):
     """Save a job's data to the database."""
@@ -50,7 +42,6 @@ def save_job_to_db(chat_id, job_data):
         logger.info(f"Job for chat_id {chat_id} saved to database.")
     except Exception as e:
         logger.error(f"Failed to save job for chat {chat_id}: {e}")
-
 
 def load_job_from_db(chat_id):
     """Load a single job's data from the database."""
@@ -67,7 +58,6 @@ def load_job_from_db(chat_id):
         logger.error(f"Failed to load job for chat {chat_id}: {e}")
     return None
 
-
 def load_all_jobs_from_db():
     """Load all jobs from the database."""
     if not os.path.exists(DB_FILE):
@@ -83,7 +73,6 @@ def load_all_jobs_from_db():
         logger.error(f"Failed to load all jobs from DB: {e}")
         return []
 
-
 def delete_job_from_db(chat_id):
     """Delete a job from the database."""
     try:
@@ -96,7 +85,6 @@ def delete_job_from_db(chat_id):
     except Exception as e:
         logger.error(f"Failed to delete job for chat {chat_id}: {e}")
 
-
 # --- Flask App Setup ---
 app = Flask(__name__)
 @app.route('/')
@@ -106,6 +94,11 @@ def index():
 def run_flask():
     app.run(host='0.0.0.0', port=8080)
 
+# --- Telegram Bot Setup ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 def remove_job_if_exists(name: str, context: CallbackContext) -> bool:
     current_jobs = context.job_queue.get_jobs_by_name(name)
@@ -118,77 +111,45 @@ def remove_job_if_exists(name: str, context: CallbackContext) -> bool:
 async def send_recurring_message(context: CallbackContext) -> None:
     job = context.job
     job_data = job.data
-    media_type = job_data.get('media_type')
-    
-    try:
-        if media_type == 'text':
-            await context.bot.send_message(job.chat_id, text=job_data['text'])
-        elif media_type == 'photo':
-            await context.bot.send_photo(job.chat_id, photo=job_data['file_id'], caption=job_data.get('caption'))
-        elif media_type == 'video':
-            await context.bot.send_video(job.chat_id, video=job_data['file_id'], caption=job_data.get('caption'))
-        elif media_type == 'document':
-            await context.bot.send_document(job.chat_id, document=job_data['file_id'], caption=job_data.get('caption'))
-        elif media_type == 'audio':
-            await context.bot.send_audio(job.chat_id, audio=job_data['file_id'], caption=job_data.get('caption'))
-        elif media_type == 'sticker':
-             await context.bot.send_sticker(job.chat_id, sticker=job_data['file_id'])
-    except Exception as e:
-        logger.error(f"Error sending message to chat {job.chat_id}: {e}. Removing job.")
-        delete_job_from_db(job.chat_id)
-        job.schedule_removal()
+    await context.bot.send_message(job.chat_id, text=job_data['text'])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Hi! I am a persistent recurring message bot.\n\n"
-        "My schedules are now saved and will survive restarts.\n\n"
-        "Use /set, /stop, and /status as before."
+        "To set a recurring message (every 1 minute), use the command:\n"
+        "`/set Your message here`\n\n"
+        "Use `/status` to see the current schedule.\n"
+        "Use `/stop` to clear the schedule.",
+        parse_mode=ParseMode.MARKDOWN_V2
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Here's how to use me:\n\n"
         "▶️ *To set a schedule (every 1 minute):*\n"
-        "1. Send any message (text, photo, etc.).\n"
-        "2. Reply to it with the `/set` command.\n\n"
+        "   Use the command `/set Your message here`\n\n"
         "▶️ *To check the schedule:*\n"
-        "   Use `/status`.\n\n"
+        "   Use `/status`\n\n"
         "▶️ *To stop the schedule:*\n"
-        "   Use `/stop`.",
+        "   Use `/stop`",
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
 async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_message.chat_id
-    replied_message = update.message.reply_to_message
-
-    if not replied_message:
-        await update.message.reply_text("Error: You must reply to a message to schedule it.")
-        return
-
     try:
+        message_to_set = " ".join(context.args)
+        if not message_to_set:
+            await update.message.reply_text("Error: You need to provide a message after the /set command.\n\nExample: `/set Hello world`")
+            return
+
         minutes = 1
         interval_seconds = 60
 
         job_data = {
-            'media_type': None, 'interval_minutes': minutes, 'text': None, 
-            'caption': None, 'file_id': None
+            'text': message_to_set,
+            'interval_minutes': minutes
         }
-        if replied_message.text:
-            job_data.update({'media_type': 'text', 'text': replied_message.text})
-        elif replied_message.photo:
-            job_data.update({'media_type': 'photo', 'file_id': replied_message.photo[-1].file_id, 'caption': replied_message.caption})
-        elif replied_message.video:
-            job_data.update({'media_type': 'video', 'file_id': replied_message.video.file_id, 'caption': replied_message.caption})
-        elif replied_message.document:
-            job_data.update({'media_type': 'document', 'file_id': replied_message.document.file_id, 'caption': replied_message.caption})
-        elif replied_message.audio:
-            job_data.update({'media_type': 'audio', 'file_id': replied_message.audio.file_id, 'caption': replied_message.caption})
-        elif replied_message.sticker:
-            job_data.update({'media_type': 'sticker', 'file_id': replied_message.sticker.file_id})
-        else:
-            await update.message.reply_text("Sorry, that media type is not supported.")
-            return
 
         save_job_to_db(chat_id, job_data)
 
@@ -209,12 +170,21 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("An error occurred while setting the timer.")
 
 async def stop_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for the /stop command. Removes the job from memory and the database."""
     chat_id = update.message.chat_id
     
-    remove_job_if_exists(str(chat_id), context)
+    # Remove from live memory
+    job_removed = remove_job_if_exists(str(chat_id), context)
+    
+    # **CRITICAL FIX:** Also remove from the persistent database
     delete_job_from_db(chat_id)
     
-    await update.message.reply_text("Timer successfully stopped! The schedule has been cleared.")
+    # Check if a job existed in either memory or DB to give a clear confirmation
+    if job_removed or load_job_from_db(chat_id) is None:
+         await update.message.reply_text("Timer successfully stopped! The schedule has been cleared.")
+    else:
+         await update.message.reply_text("You do not have an active timer.")
+
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -230,23 +200,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if current_jobs and current_jobs[0].next_t:
         next_run_display = current_jobs[0].next_t.strftime('%Y-%m-%d %H:%M:%S UTC')
 
-    interval = job_data.get('interval_minutes', 'N/A')
-    media_type = job_data.get('media_type', 'Unknown').capitalize()
-    
-    content_desc = "Not available"
-    if media_type.lower() == 'text':
-        text = job_data.get('text', '')
-        content_desc = f"\"{text[:70]}...\"" if len(text) > 70 else f"\"{text}\""
-    else:
-        content_desc = f"A {media_type.lower()} message"
-        caption = job_data.get('caption')
-        if caption:
-            content_desc += f" with caption: \"{caption}\""
+    text = job_data.get('text', '')
+    content_desc = f"\"{text[:70]}...\"" if len(text) > 70 else f"\"{text}\""
     
     status_message = (
         f"ℹ️ **Current Schedule Status**\n\n"
         f"**Frequency:** Every 1 minute\n"
-        f"**Content Type:** {media_type}\n"
         f"**Content Preview:** {content_desc}\n"
         f"**Next Send Time:** {next_run_display}"
     )
@@ -260,16 +219,17 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     """Run the bot, the web server, and load jobs from the database."""
-    # --- NEW: Diagnostic check for disk permissions ---
-    logger.info("Checking persistent disk permissions...")
+    # --- Diagnostic check for disk permissions ---
     if os.path.isdir(DISK_PATH):
-        if os.access(DISK_PATH, os.W_OK):
-            logger.info(f"✅ Success: Disk path {DISK_PATH} is a writable directory.")
-        else:
+        if not os.access(DISK_PATH, os.W_OK):
             logger.critical(f"❌ CRITICAL ERROR: Disk path {DISK_PATH} is NOT WRITABLE.")
     else:
-        logger.critical(f"❌ CRITICAL ERROR: Disk path {DISK_PATH} does NOT exist.")
-
+        try:
+            os.makedirs(DISK_PATH)
+            logger.info(f"✅ Success: Created writable disk path at {DISK_PATH}.")
+        except Exception as e:
+            logger.critical(f"❌ CRITICAL ERROR: Could not create disk path {DISK_PATH}. Error: {e}")
+    
     init_db()
 
     flask_thread = threading.Thread(target=run_flask)
@@ -305,4 +265,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-                         
+        
