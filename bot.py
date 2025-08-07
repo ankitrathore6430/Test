@@ -9,66 +9,93 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.constants import ParseMode
 
 # --- Persistent Disk Setup ---
-# This path corresponds to the Mount Path you set up in Render's Disks.
 DISK_PATH = "/var/data"
 DB_FILE = os.path.join(DISK_PATH, "jobs.db")
 
-# NOTE: The os.makedirs call has been removed as Render creates the mount path automatically.
+# --- Telegram Bot Setup ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 
 def init_db():
     """Initialize the SQLite database in the persistent disk path."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS jobs (
-            chat_id INTEGER PRIMARY KEY,
-            job_data BLOB
-        )
-    ''')
-    conn.commit()
-    conn.close()
-    logger.info(f"Database initialized at {DB_FILE}")
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS jobs (
+                chat_id INTEGER PRIMARY KEY,
+                job_data BLOB
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info(f"Database initialized successfully at {DB_FILE}")
+    except sqlite3.OperationalError as e:
+        logger.critical(f"FAILED TO INITIALIZE DATABASE at {DB_FILE}: {e}")
+        logger.critical("This is likely a file permissions issue on your hosting service. Ensure the bot has write access to the persistent disk directory.")
+
 
 def save_job_to_db(chat_id, job_data):
     """Save a job's data to the database."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    serialized_data = pickle.dumps(job_data)
-    cursor.execute("INSERT OR REPLACE INTO jobs (chat_id, job_data) VALUES (?, ?)", (chat_id, serialized_data))
-    conn.commit()
-    conn.close()
-    logger.info(f"Job for chat_id {chat_id} saved to database.")
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        serialized_data = pickle.dumps(job_data)
+        cursor.execute("INSERT OR REPLACE INTO jobs (chat_id, job_data) VALUES (?, ?)", (chat_id, serialized_data))
+        conn.commit()
+        conn.close()
+        logger.info(f"Job for chat_id {chat_id} saved to database.")
+    except Exception as e:
+        logger.error(f"Failed to save job for chat {chat_id}: {e}")
+
 
 def load_job_from_db(chat_id):
     """Load a single job's data from the database."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT job_data FROM jobs WHERE chat_id = ?", (chat_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return pickle.loads(row[0])
+    if not os.path.exists(DB_FILE): return None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT job_data FROM jobs WHERE chat_id = ?", (chat_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return pickle.loads(row[0])
+    except Exception as e:
+        logger.error(f"Failed to load job for chat {chat_id}: {e}")
     return None
+
 
 def load_all_jobs_from_db():
     """Load all jobs from the database."""
     if not os.path.exists(DB_FILE):
         return []
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT chat_id, job_data FROM jobs")
-    rows = cursor.fetchall()
-    conn.close()
-    return [(row[0], pickle.loads(row[1])) for row in rows]
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT chat_id, job_data FROM jobs")
+        rows = cursor.fetchall()
+        conn.close()
+        return [(row[0], pickle.loads(row[1])) for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to load all jobs from DB: {e}")
+        return []
+
 
 def delete_job_from_db(chat_id):
     """Delete a job from the database."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM jobs WHERE chat_id = ?", (chat_id,))
-    conn.commit()
-    conn.close()
-    logger.info(f"Job for chat_id {chat_id} deleted from database.")
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM jobs WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"Job for chat_id {chat_id} deleted from database.")
+    except Exception as e:
+        logger.error(f"Failed to delete job for chat {chat_id}: {e}")
+
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -79,11 +106,6 @@ def index():
 def run_flask():
     app.run(host='0.0.0.0', port=8080)
 
-# --- Telegram Bot Setup ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 def remove_job_if_exists(name: str, context: CallbackContext) -> bool:
     current_jobs = context.job_queue.get_jobs_by_name(name)
@@ -113,7 +135,6 @@ async def send_recurring_message(context: CallbackContext) -> None:
              await context.bot.send_sticker(job.chat_id, sticker=job_data['file_id'])
     except Exception as e:
         logger.error(f"Error sending message to chat {job.chat_id}: {e}. Removing job.")
-        # If sending fails (e.g., bot blocked), remove the job to prevent repeated errors.
         delete_job_from_db(job.chat_id)
         job.schedule_removal()
 
@@ -239,6 +260,16 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     """Run the bot, the web server, and load jobs from the database."""
+    # --- NEW: Diagnostic check for disk permissions ---
+    logger.info("Checking persistent disk permissions...")
+    if os.path.isdir(DISK_PATH):
+        if os.access(DISK_PATH, os.W_OK):
+            logger.info(f"✅ Success: Disk path {DISK_PATH} is a writable directory.")
+        else:
+            logger.critical(f"❌ CRITICAL ERROR: Disk path {DISK_PATH} is NOT WRITABLE.")
+    else:
+        logger.critical(f"❌ CRITICAL ERROR: Disk path {DISK_PATH} does NOT exist.")
+
     init_db()
 
     flask_thread = threading.Thread(target=run_flask)
@@ -274,4 +305,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
+                         
