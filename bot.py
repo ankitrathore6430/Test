@@ -8,11 +8,17 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext
 from telegram.constants import ParseMode
 
-# --- Database Setup ---
-DB_FILE = "jobs.db"
+# --- Persistent Disk Setup ---
+# This path corresponds to the Mount Path you set up in Render's Disks.
+DISK_PATH = "/var/data"
+DB_FILE = os.path.join(DISK_PATH, "jobs.db")
+
+# Ensure the directory for the database exists
+if not os.path.exists(DISK_PATH):
+    os.makedirs(DISK_PATH)
 
 def init_db():
-    """Initialize the SQLite database."""
+    """Initialize the SQLite database in the persistent disk path."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -23,15 +29,13 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
-    logger.info("Database initialized.")
+    logger.info(f"Database initialized at {DB_FILE}")
 
 def save_job_to_db(chat_id, job_data):
     """Save a job's data to the database."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Serialize the job_data dictionary using pickle
     serialized_data = pickle.dumps(job_data)
-    # Use INSERT OR REPLACE to handle both new and existing jobs
     cursor.execute("INSERT OR REPLACE INTO jobs (chat_id, job_data) VALUES (?, ?)", (chat_id, serialized_data))
     conn.commit()
     conn.close()
@@ -45,7 +49,6 @@ def load_job_from_db(chat_id):
     row = cursor.fetchone()
     conn.close()
     if row:
-        # Deserialize the data using pickle
         return pickle.loads(row[0])
     return None
 
@@ -58,7 +61,6 @@ def load_all_jobs_from_db():
     cursor.execute("SELECT chat_id, job_data FROM jobs")
     rows = cursor.fetchall()
     conn.close()
-    # Deserialize each job's data
     return [(row[0], pickle.loads(row[1])) for row in rows]
 
 def delete_job_from_db(chat_id):
@@ -101,7 +103,6 @@ async def send_recurring_message(context: CallbackContext) -> None:
     try:
         if media_type == 'text':
             await context.bot.send_message(job.chat_id, text=job_data['text'])
-        # ... (add other media types as before)
         elif media_type == 'photo':
             await context.bot.send_photo(job.chat_id, photo=job_data['file_id'], caption=job_data.get('caption'))
         elif media_type == 'video':
@@ -113,7 +114,10 @@ async def send_recurring_message(context: CallbackContext) -> None:
         elif media_type == 'sticker':
              await context.bot.send_sticker(job.chat_id, sticker=job_data['file_id'])
     except Exception as e:
-        logger.error(f"Error sending scheduled message to chat {job.chat_id}: {e}")
+        logger.error(f"Error sending message to chat {job.chat_id}: {e}. Removing job.")
+        # If sending fails (e.g., bot blocked), remove the job to prevent repeated errors.
+        delete_job_from_db(job.chat_id)
+        job.schedule_removal()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -125,9 +129,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Here's how to use me:\n\n"
-        "▶️ *To set a schedule:*\n"
+        "▶️ *To set a schedule (every 1 minute):*\n"
         "1. Send any message (text, photo, etc.).\n"
-        "2. Reply to it with `/set <minutes>`.\n\n"
+        "2. Reply to it with the `/set` command.\n\n"
         "▶️ *To check the schedule:*\n"
         "   Use `/status`.\n\n"
         "▶️ *To stop the schedule:*\n"
@@ -144,16 +148,13 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        minutes = int(context.args[0])
-        if not 1 <= minutes <= 60:
-            await update.effective_message.reply_text("Error: Please provide a time between 1 and 60 minutes.")
-            return
+        minutes = 1
+        interval_seconds = 60
 
         job_data = {
             'media_type': None, 'interval_minutes': minutes, 'text': None, 
             'caption': None, 'file_id': None
         }
-        # ... (logic to populate job_data based on replied_message)
         if replied_message.text:
             job_data.update({'media_type': 'text', 'text': replied_message.text})
         elif replied_message.photo:
@@ -170,11 +171,8 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Sorry, that media type is not supported.")
             return
 
-        # Save to DB first
         save_job_to_db(chat_id, job_data)
 
-        # Then schedule in memory
-        interval_seconds = minutes * 60
         remove_job_if_exists(str(chat_id), context)
         context.job_queue.run_repeating(
             send_recurring_message,
@@ -185,15 +183,15 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             data=job_data
         )
 
-        await update.effective_message.reply_text(f"✅ Message set successfully! It will repeat every {minutes} minute(s).")
+        await update.effective_message.reply_text(f"✅ Message set successfully! It will now repeat every minute.")
 
-    except (IndexError, ValueError):
-        await update.effective_message.reply_text("Usage: Reply to a message with `/set <minutes>`")
+    except Exception as e:
+        logger.error(f"Error in set_timer for chat {chat_id}: {e}")
+        await update.effective_message.reply_text("An error occurred while setting the timer.")
 
 async def stop_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     
-    # Remove from memory and DB
     remove_job_if_exists(str(chat_id), context)
     delete_job_from_db(chat_id)
     
@@ -202,16 +200,14 @@ async def stop_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     
-    # Check the database directly for the most reliable status
     job_data = load_job_from_db(chat_id)
 
     if not job_data:
         await update.message.reply_text("There is no recurring message scheduled for this chat.")
         return
 
-    # Check in-memory jobs to get the next run time
     current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    next_run_display = "Pending restart..."
+    next_run_display = "Active (will send after next restart/interval)"
     if current_jobs and current_jobs[0].next_t:
         next_run_display = current_jobs[0].next_t.strftime('%Y-%m-%d %H:%M:%S UTC')
 
@@ -230,7 +226,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     status_message = (
         f"ℹ️ **Current Schedule Status**\n\n"
-        f"**Frequency:** Every {interval} minute(s)\n"
+        f"**Frequency:** Every 1 minute\n"
         f"**Content Type:** {media_type}\n"
         f"**Content Preview:** {content_desc}\n"
         f"**Next Send Time:** {next_run_display}"
@@ -245,34 +241,29 @@ async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     """Run the bot, the web server, and load jobs from the database."""
-    # Initialize the database
     init_db()
 
-    # Start Flask server
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     logger.info("Uptime server started.")
 
-    # --- Telegram Bot Setup ---
     BOT_TOKEN = "1233674761:AAEBZHtON8aNiahNYslG4Hi9IqQFIaQUFUE"
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Load and reschedule jobs from the database on startup
     jobs_to_load = load_all_jobs_from_db()
     for chat_id, job_data in jobs_to_load:
-        interval_seconds = job_data.get('interval_minutes', 1) * 60
+        interval_seconds = 60
         application.job_queue.run_repeating(
             send_recurring_message,
             interval=interval_seconds,
-            first=10,  # Send 10s after restart to avoid spam
+            first=10,
             chat_id=chat_id,
             name=str(chat_id),
             data=job_data
         )
     logger.info(f"Loaded and rescheduled {len(jobs_to_load)} jobs from the database.")
 
-    # Register command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("set", set_timer))
@@ -280,10 +271,9 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
 
-    # Start the Bot
     logger.info("Bot is running...")
     application.run_polling()
 
 if __name__ == "__main__":
     main()
-        
+                         
