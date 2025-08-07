@@ -13,9 +13,7 @@ from telegram.constants import ParseMode
 DISK_PATH = "/var/data"
 DB_FILE = os.path.join(DISK_PATH, "jobs.db")
 
-# Ensure the directory for the database exists
-if not os.path.exists(DISK_PATH):
-    os.makedirs(DISK_PATH)
+# NOTE: The os.makedirs call has been removed as Render creates the mount path automatically.
 
 def init_db():
     """Initialize the SQLite database in the persistent disk path."""
@@ -276,4 +274,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-                         
+    
